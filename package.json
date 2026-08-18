@@ -16,6 +16,7 @@
     "format": "biome format --write .",
     "lint": "biome lint --write .",
     "lint:unsafe": "biome lint --write --unsafe .",
+    "nex:node": "python3 services/ledger/nex_core.py",
     "storybook:dev": "storybook dev -p 6006",
     "storybook:build": "storybook build",
     "storybook:test": "test-storybook",
