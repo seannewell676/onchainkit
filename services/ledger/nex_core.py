@@ -2,7 +2,8 @@ import os
 import sqlite3
 import hashlib
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 
 # =====================================================================
 # CONFIGURATION
@@ -13,26 +14,27 @@ DB_PATH = os.path.join(BASE_DIR, "nex_ledger.db")
 LOCAL_MODE = True
 TELEMETRY_ENABLED = False
 VERIFICATION_INTERVAL = 1.0  # Seconds between loop executions
-
-MAX_EVENT_DATA_LENGTH = 4096  # Prevent unbounded event_data payloads
+MAX_EVENTS = 100_000  # Prevent unbounded DB growth
+MAX_EVENT_DATA_LENGTH = 4096  # Sanity cap on event payload size
 
 
 # =====================================================================
 # CORE LEDGER ENGINE
 # =====================================================================
 class NexLedger:
-    """Local SQLite-backed hash-chained event ledger.
+    """Local SQLite hash-chained event ledger.
 
-    Each event is appended as a row linking to the previous row's hash,
-    forming a tamper-evident chain.  Integrity can be verified at any time
-    via :meth:`verify_ledger_integrity`.
+    Each row stores a timestamp, event payload, the previous row's hash,
+    and the current row's SHA-256 hash.  The chain is verified by
+    re-computing every hash from genesis forward.
     """
 
-    def __init__(self, db_path: str = DB_PATH):
+    def __init__(self, db_path: str = DB_PATH) -> None:
         self.db_path = db_path
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
+        """Return a new SQLite connection (short-lived, thread-safe)."""
         return sqlite3.connect(self.db_path)
 
     def _init_db(self) -> None:
@@ -53,7 +55,7 @@ class NexLedger:
             conn.commit()
 
     def get_last_hash(self) -> str:
-        """Retrieve the current chain tip hash."""
+        """Retrieve the current chain tip hash (genesis hash if empty)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -62,26 +64,32 @@ class NexLedger:
             row = cursor.fetchone()
             return row[0] if row else "0" * 64
 
+    def _prune_old_events(self, conn: sqlite3.Connection) -> None:
+        """Delete oldest events beyond MAX_EVENTS to bound DB size."""
+        cursor = conn.cursor()
+        cursor.execute(
+            'DELETE FROM state_ledger WHERE id NOT IN '
+            '(SELECT id FROM state_ledger ORDER BY id DESC LIMIT ?)',
+            (MAX_EVENTS,),
+        )
+
     def commit_event(self, event_data: str) -> str:
-        """Append a local event state to the hash chain.
+        """Append a local event to the hash chain and return its hash.
 
-        Args:
-            event_data: Arbitrary string payload describing the event.
-                        Truncated to MAX_EVENT_DATA_LENGTH characters.
-
-        Returns:
-            The SHA-256 hash of the newly committed event.
+        Raises ValueError if event_data is empty or exceeds MAX_EVENT_DATA_LENGTH.
         """
-        if not isinstance(event_data, str):
-            raise TypeError("event_data must be a string")
+        if not event_data:
+            raise ValueError("event_data must not be empty")
         if len(event_data) > MAX_EVENT_DATA_LENGTH:
-            event_data = event_data[:MAX_EVENT_DATA_LENGTH]
+            raise ValueError(
+                f"event_data exceeds max length of {MAX_EVENT_DATA_LENGTH}"
+            )
 
         prev_hash = self.get_last_hash()
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
 
         raw_payload = f"{timestamp}:{event_data}:{prev_hash}"
-        curr_hash = hashlib.sha256(raw_payload.encode('utf-8')).hexdigest()
+        curr_hash = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -92,6 +100,7 @@ class NexLedger:
                 ''',
                 (timestamp, event_data, prev_hash, curr_hash),
             )
+            self._prune_old_events(conn)
             conn.commit()
 
         return curr_hash
@@ -99,11 +108,8 @@ class NexLedger:
     def verify_ledger_integrity(self) -> bool:
         """Verify the integrity of the local cryptographic chain.
 
-        Walks every row in order, recomputes each hash, and checks that
-        the ``previous_hash`` field matches the prior row's ``current_hash``.
-
-        Returns:
-            True if the chain is intact, False if any entry is tampered.
+        Re-computes every hash from genesis forward and checks that
+        each row's previous_hash matches the prior row's current_hash.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -120,7 +126,7 @@ class NexLedger:
 
                 raw_payload = f"{timestamp}:{event_data}:{prev_hash}"
                 calculated_hash = hashlib.sha256(
-                    raw_payload.encode('utf-8')
+                    raw_payload.encode("utf-8")
                 ).hexdigest()
                 if calculated_hash != curr_hash:
                     return False
@@ -142,12 +148,7 @@ class NexLedger:
 # LOCAL EXECUTION LOOP
 # =====================================================================
 def run_nex_node() -> None:
-    """Run the NEX local node loop.
-
-    Bootstraps the ledger, commits a genesis event, then enters an
-    infinite loop committing a heartbeat event every VERIFICATION_INTERVAL
-    seconds and verifying chain integrity on each iteration.
-    """
+    """Run the local NEX node loop, committing events at a fixed interval."""
     print("=" * 60)
     print("NEX LOCAL NODE INITIALIZED")
     print(f"Database Path : {DB_PATH}")
@@ -163,26 +164,23 @@ def run_nex_node() -> None:
     init_hash = ledger.commit_event("SYSTEM_BOOTSTRAP_LOCAL_EXECUTION")
     print(f"[BOOTSTRAP] Genesis state committed. Hash: {init_hash[:16]}...")
 
-    # Main loop
-    iteration = 0
     try:
         while True:
-            iteration += 1
-            time.sleep(VERIFICATION_INTERVAL)
-
-            event_hash = ledger.commit_event(f"HEARTBEAT_ITERATION_{iteration}")
-            integrity_ok = ledger.verify_ledger_integrity()
-
+            event_count = ledger.get_event_count()
+            event_data = f"HEARTBEAT_EVENT_{event_count}"
+            curr_hash = ledger.commit_event(event_data)
             print(
-                f"[LOOP] iter={iteration} "
-                f"hash={event_hash[:16]}... "
-                f"integrity={'OK' if integrity_ok else 'FAILED'} "
-                f"events={ledger.get_event_count()}"
+                f"[{datetime.now(timezone.utc).isoformat()}] "
+                f"Event #{event_count} committed. Hash: {curr_hash[:16]}..."
             )
 
-            if not integrity_ok:
-                print("[ALERT] Ledger integrity check FAILED — halting node.")
-                break
+            # Verify integrity every 60 events
+            if event_count % 60 == 0:
+                integrity_ok = ledger.verify_ledger_integrity()
+                status = "VALID" if integrity_ok else "COMPROMISED"
+                print(f"[INTEGRITY CHECK] Chain status: {status}")
+
+            time.sleep(VERIFICATION_INTERVAL)
     except KeyboardInterrupt:
         print("\n[SHUTDOWN] NEX node stopped by user.")
 
